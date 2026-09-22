@@ -1,0 +1,73 @@
+// For format details, see https://aka.ms/devcontainer.json. For config options, see the
+// README at: https://github.com/devcontainers/templates/tree/main/src/rust
+{
+    "workspaceMount": "source=polars-logfmt-workspace-master,target=/workspace,type=volume",
+    "workspaceFolder": "/workspace/polars-logfmt",
+    "name": "Rust",
+    // Or use a Dockerfile or Docker Compose file. More info: https://containers.dev/guide/dockerfile
+    "image": "mcr.microsoft.com/devcontainers/rust:2.0.6-bookworm",
+    // Use 'mounts' to make the cargo cache persistent in a Docker Volume.
+    // "mounts": [
+    // 	{
+    // 		"source": "devcontainer-cargo-cache-${devcontainerId}",
+    // 		"target": "/usr/local/cargo",
+    // 		"type": "volume"
+    // 	}
+    // ]
+    // Features to add to the dev container. More info: https://containers.dev/features.
+    "features": {
+        "ghcr.io/devcontainers/features/docker-in-docker:2": {
+            "version": "latest"
+        },
+        "ghcr.io/devcontainers/features/go:1": {
+            "version": "latest"
+        },
+        "ghcr.io/danzilberdan/devcontainers/opencode:0": {
+            "version": "latest"
+        },
+        "ghcr.io/eitsupi/devcontainer-features/nushell:0": {
+            "version": "latest"
+        }
+    },
+    // Use 'forwardPorts' to make a list of ports inside the container available locally.
+    // "forwardPorts": [],
+    // Use 'postCreateCommand' to run commands after the container is created.
+    // "postCreateCommand": "rustc --version",
+    // Configure tool-specific properties.
+    "customizations": {
+        "vscode": {
+            "extensions": ["rust-lang.rust-analyzer"],
+            "settings": {
+                "[rust]": {
+                    "editor.defaultFormatter": "rust-lang.rust-analyzer",
+                    "editor.formatOnSave": true
+                },
+                "rust-analyzer.checkOnSave.command": "clippy",
+                "rust-analyzer.cargo.sysroot": "discover",
+                "rust-analyzer.procMacro.enable": true,
+                "rust-analyzer.semanticTokens.enable": true
+            }
+        }
+    },
+    // Uncomment to connect as root instead. More info: https://aka.ms/dev-containers-non-root.
+    "remoteUser": "vscode",
+    // avoid bug https://github.com/zed-industries/zed/issues/46252
+    // https://github.com/zed-industries/zed/pull/48230
+    "containerUser": "vscode",
+    "containerEnv": {
+        "SHELL": "/bin/zsh",
+        "SSH_AUTH_SOCK": "/tmp/ssh-agent.sock"
+    },
+    "mounts": [
+        {
+            "source": "/home/${localEnv:USER}/.docker-context",
+            "target": "/workspace/ssh-agents",
+            "type": "bind"
+        },
+        {
+            "source": "/mnt/bcachefs",
+            "target": "/workspace/bcachefs",
+            "type": "bind"
+        }
+    ]
+}

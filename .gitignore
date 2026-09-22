@@ -1,0 +1,15 @@
+._*
+target/
+seekzstdsep/
+seekzstdsep/**/*
+logs
+polars-logfmt/flamegraph.svg
+polars-logfmt/out.perf
+polars-logfmt/perf.data
+polars-logfmt/profile.json.gz
+polars-logfmt/profile.json.gz.old
+polars-logfmt/err.log
+polars-logfmt/result.txt
+polars-logfmt/lcov.info
+*.jsonl
+*.seek.zst

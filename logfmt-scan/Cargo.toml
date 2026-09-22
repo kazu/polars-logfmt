@@ -1,0 +1,21 @@
+[package]
+name = "logfmt_scan"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95.0"
+publish = false
+description = "The logfmt scan source for nu_plugin_polars_dyn, to compile in with nu-polars-dyn-build."
+
+[lib]
+bench = false
+test = false
+doctest = false
+
+[dependencies]
+nu_plugin_polars_dyn = { git = "https://github.com/kazu/nu_plugin_polars_dyn", branch = "main" }
+polars_logfmt = { path = "../polars-logfmt" }
+polars = "=0.55.2"
+serde_json = "=1.0.151"
+
+[lints.clippy]
+unwrap_used = "deny"

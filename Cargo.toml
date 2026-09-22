@@ -1,0 +1,16 @@
+[workspace]
+members = ["./polars-logfmt", "./logfmt-scan"]
+
+resolver = "3"
+
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = false
+
+[profile.samply]
+inherits = "release"
+debug = 2
+strip = "none"
+split-debuginfo = "off" # 情報を外に出さない（以前の挙動に戻す）
+lto = false

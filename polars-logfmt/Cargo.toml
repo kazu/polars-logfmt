@@ -1,0 +1,38 @@
+[package]
+name = "polars_logfmt"
+version = "0.1.0"
+edition = "2024"
+description = "Read logfmt logs, local or over SSH, plain or seekable zstd, into Polars LazyFrames"
+license = "MIT"
+repository = "https://github.com/kazu/polars-logfmt"
+readme = "../README.md"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+chrono = "0.4"
+memory-stats = "1"
+polars = { version = "~0.55.2", features = ["parquet", "streaming", "lazy", "fmt", "strings", "dtype-struct", "regex", "asof_join", "dtype-datetime", "timezones"] }
+
+polars-core = "~0.55.2"
+polars-arrow = "~0.55.2"
+ssh2 = "0.9"
+url = "2"
+zstd = "0.13"
+humantime = "2.3.0"
+itertools = "0.14.0"
+zeekstd = "0.6.2"
+tempfile = "3.24.0"
+rayon = "1.8"
+log = "0.4"
+env_logger = "0.10"
+arrayvec = "0.7.6"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-log = "0.1"
+tracing-logfmt = "0.3"
+hashbrown = "0.16.1"
+memchr = "2.7.6"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.151"
+seekzstdsep = "0.7"

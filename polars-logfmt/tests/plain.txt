@@ -1,0 +1,2 @@
+plain file for vfs test
+0123456789abcdef
