@@ -19,7 +19,7 @@ use polars_core::runtime::RAYON;
 use polars_core::utils::accumulate_dataframes_vertical;
 use std::any::Any;
 use std::io::{BufRead, BufReader, Cursor, Read};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 // use arrayvec::ArrayVec;
@@ -310,20 +310,12 @@ impl LazyLogFmtReader {
     fn parallel_batch(
         &self,
         scan_opts: &AnonymousScanArgs,
-        batch_size: Option<usize>,
         schema: &mut Option<Schema>,
         line_filter: Option<LineFilterFn>,
         row_filter: Option<&RowFilter>,
         state: &mut LogFmtReaderState,
     ) -> PolarsResult<Option<DataFrame>> {
-        match self._parallel_batch(
-            scan_opts,
-            batch_size,
-            schema,
-            line_filter,
-            row_filter,
-            state,
-        ) {
+        match self._parallel_batch(scan_opts, schema, line_filter, row_filter, state) {
             Ok(r) => match r {
                 Some(df) => Ok(Some(df)),
                 None => {
@@ -342,15 +334,15 @@ impl LazyLogFmtReader {
     fn _parallel_batch(
         &self,
         scan_opts: &AnonymousScanArgs,
-        batch_size: Option<usize>,
         schema: &mut Option<Schema>,
         line_filter: Option<LineFilterFn>,
         row_filter: Option<&RowFilter>,
         state: &mut LogFmtReaderState,
     ) -> PolarsResult<Option<DataFrame>> {
+        let n_rows = scan_opts.n_rows;
         // Only attempt when source is Seekable
         tracing::debug!(
-            batch_size = ?batch_size,
+            n_rows = ?n_rows,
             n_threads = ?self.n_threads,
             "tparallel_batch entry",
         );
@@ -386,18 +378,9 @@ impl LazyLogFmtReader {
         let frame_ranges = frames;
         tracing::debug!(frames_len = frame_ranges.len(), "frames_len");
         let max_inflight = self.max_inflight();
-        // shared counter and stop flag to limit total returned rows to batch_size
-        // Only create these when a batch_size is specified. If both
-        // `scan_opts.n_rows` and `self.batch_size` are None, we avoid
-        // creating and touching these atomics to remove contention.
-        let rows_counter_opt: Option<Arc<AtomicUsize>> = if batch_size.is_some() {
-            Some(Arc::new(AtomicUsize::new(0)))
-        } else {
-            None
-        };
-        // Always create a stop flag so workers can be signaled to stop
-        // for reasons other than batch-size saturation in the future.
-        let stop_flag_opt: Option<Arc<AtomicBool>> = Some(Arc::new(AtomicBool::new(false)));
+        // the slice: `n_rows` slots the workers claim one raw row at a time
+        let slots = AtomicUsize::new(0);
+        let row_cap: Option<(usize, &AtomicUsize)> = n_rows.map(|n| (n, &slots));
         let schema_owned = schema.as_ref().cloned();
         let row_filter_owned: Option<RowFilter> = row_filter.map(|r| Arc::clone(r));
         let pred_owned = scan_opts.predicate.clone();
@@ -433,8 +416,6 @@ impl LazyLogFmtReader {
         let schema_clone = schema_owned.clone();
         let row_filter_clone_outer = row_filter_owned.clone();
         let line_filter_copy = line_filter;
-        let counter_clone_outer = rows_counter_opt.clone();
-        let stop_clone_outer = stop_flag_opt.clone();
         let with_columns_owned: Option<Vec<String>> = scan_opts
             .with_columns
             .as_ref()
@@ -474,9 +455,7 @@ impl LazyLogFmtReader {
                                 line_filter_copy.clone(),
                                 row_filter_clone_outer.as_ref(),
                                 pred_clone,
-                                batch_size,
-                                counter_clone_outer.clone(),
-                                stop_clone_outer.clone(),
+                                row_cap,
                                 aligned_cols_cnt,
                                 with_cols_local.as_ref(),
                             )?;
@@ -520,23 +499,28 @@ impl LazyLogFmtReader {
         }
 
         let start_acc_time = std::time::Instant::now();
-        match accumulate_dataframes_vertical(df_all) {
-            Ok(df) => match df.height() > 0 {
-                true => {
-                    tracing::debug!(elapsed = %humantime::format_duration(start_acc_time.elapsed()),
-                "finish global accumulate_dataframes_vertical");
-                    state.finished = true;
-                    return Ok(Some(df));
-                }
-                false => {
-                    return Ok(None);
-                }
-            },
+        let df = match accumulate_dataframes_vertical(df_all) {
+            Ok(df) => df,
             Err(e) => {
                 tracing::debug!(error = %e, "error:accumulate_dataframes_vertical ");
                 return Ok(None);
             }
         };
+        tracing::debug!(elapsed = %humantime::format_duration(start_acc_time.elapsed()),
+                "finish global accumulate_dataframes_vertical");
+        // With a slice the workers returned at most `n_rows` raw rows in total:
+        // filter and project them now. The slice is final, so the reader is
+        // finished even when nothing passes the predicate.
+        let df = match n_rows {
+            Some(_) => apply_pushdown(
+                df,
+                scan_opts.predicate.as_ref(),
+                with_columns_owned.as_ref(),
+            )?,
+            None => df,
+        };
+        state.finished = true;
+        Ok(Some(df))
     }
     fn wrrap_next_batch(&self, scan_opts: &AnonymousScanArgs) -> PolarsResult<Option<DataFrame>> {
         let batch_size = scan_opts.n_rows.or(self.batch_size);
@@ -566,7 +550,6 @@ impl LazyLogFmtReader {
             && state.offset == 0
             && let Some(df) = self.parallel_batch(
                 &scan_opts,
-                batch_size,
                 &mut schema,
                 line_filter.clone(),
                 row_filter,
@@ -724,23 +707,15 @@ impl LazyLogFmtReader {
             state.finished = true;
         }
 
-        let mut df = rows_to_dataframe_filled(&accumulated, Some(used_schema))
+        let df = rows_to_dataframe_filled(&accumulated, Some(used_schema))
             .map_err(|e| polars::error::PolarsError::ComputeError(e.to_string().into()))?;
 
         // apply predicate/with_columns after accumulation (aligns with parallel path)
-        if let Some(pred) = &scan_opts.predicate {
-            use polars::prelude::IntoLazy;
-            let filtered = df.lazy().filter(pred.clone()).collect().map_err(
-                |e: polars::error::PolarsError| {
-                    polars::error::PolarsError::ComputeError(e.to_string().into())
-                },
-            )?;
-            df = filtered;
-        }
-        if let Some(cols) = &scan_opts.with_columns {
-            let names: Vec<String> = cols.iter().map(|s| s.to_string()).collect();
-            df = df.select(&names)?;
-        }
+        let with_columns: Option<Vec<String>> = scan_opts
+            .with_columns
+            .as_ref()
+            .map(|cols| cols.iter().map(|s| s.to_string()).collect());
+        let df = apply_pushdown(df, scan_opts.predicate.as_ref(), with_columns.as_ref())?;
 
         // enforce batch_size on the returned frame (None = unlimited)
         let out = match batch_size {
@@ -873,10 +848,8 @@ impl LazyLogFmtReader {
         }
     }
 
-    /// Read and parse multiple contiguous frames from a cloned seekable handle.
-    /// Processes each frame sequentially, applies `predicate` and `with_columns` per-frame,
-    /// claims rows against `counter` up to `batch_size`, and stops early using `stop_flag`.
-    /// Returns a single concatenated `DataFrame` for the provided frames (may be empty).
+    /// Read and parse contiguous frames from a cloned seekable handle.
+    /// With `row_cap = (n, counter)`, stop once `counter` has reached `n`.
     pub fn read_and_parse_from_frames(
         worker: usize,
         mut handle: Box<dyn crate::SeekableVfsFile + Send>,
@@ -885,9 +858,7 @@ impl LazyLogFmtReader {
         line_filter: Option<LineFilterFn>,
         row_filter: Option<&RowFilter>,
         predicate: Option<Expr>,
-        batch_size: Option<usize>,
-        counter: Option<Arc<AtomicUsize>>,
-        stop_flag: Option<Arc<AtomicBool>>,
+        row_cap: Option<(usize, &AtomicUsize)>,
         aligned_cols_cnt: bool,
         with_columns: Option<&Vec<String>>,
     ) -> PolarsResult<DataFrame> {
@@ -908,7 +879,7 @@ impl LazyLogFmtReader {
                            df_maker: &mut DataFrameMaker,
                            buf: &mut Vec<u8>,
                            use_df_maker: bool,
-                           _is_last: bool|
+                           capped: &mut bool|
          -> PolarsResult<Option<DataFrame>> {
             tracing::trace!(
                 worker = worker,
@@ -917,9 +888,11 @@ impl LazyLogFmtReader {
                 len = range.len,
                 "process_one start",
             );
-            if let Some(stop) = &stop_flag
-                && stop.load(Ordering::Relaxed)
+            // the slice was filled by the other workers: do not read this frame
+            if let Some((n, slots)) = row_cap
+                && slots.load(Ordering::Relaxed) >= n
             {
+                *capped = true;
                 return Ok(None);
             }
 
@@ -978,6 +951,12 @@ impl LazyLogFmtReader {
                     && !filter(&line)
                 {
                     continue;
+                }
+                if let Some((n, slots)) = row_cap
+                    && slots.fetch_add(1, Ordering::Relaxed) >= n
+                {
+                    *capped = true;
+                    break;
                 }
                 if first_row.is_none() && schema.is_none() {
                     let r = parse_logfmt_line(&line);
@@ -1064,44 +1043,21 @@ impl LazyLogFmtReader {
                 return Ok(None);
             }
 
-            let mut df = rows_to_dataframe_filled(&rows, used_schema.as_ref())
+            let df = rows_to_dataframe_filled(&rows, used_schema.as_ref())
                 .map_err(|e| polars::error::PolarsError::ComputeError(e.to_string().into()))?;
 
-            // if use_df_maker {
-            //     df_maker.clear();
-            // }
-
-            if let Some(pred) = &predicate {
-                use polars::prelude::IntoLazy;
-                df = df.lazy().filter(pred.clone()).collect().map_err(
-                    |e: polars::error::PolarsError| {
-                        polars::error::PolarsError::ComputeError(e.to_string().into())
-                    },
-                )?;
-            }
-            if let Some(cols) = with_columns
-                && !cols.is_empty()
-            {
-                df = df.select(cols)?;
-            }
-            Ok(Some(df))
+            Ok(Some(apply_pushdown(df, predicate.as_ref(), with_columns)?))
         };
 
-        // Process each range sequentially, claiming rows as we go.
+        // Process each range sequentially until the chunk or the slice runs out.
         let mut parts: Vec<DataFrame> = Vec::new();
+        let mut capped = false;
 
         // per-worker reusable buffer to avoid repeated allocations across frames
         let mut buf: Vec<u8> = Vec::new();
 
         for (i, range) in ranges.iter().enumerate() {
-            //for range in ranges.iter() {
-            if let Some(stop) = &stop_flag
-                && stop.load(Ordering::Relaxed)
-            {
-                break;
-            }
-
-            let process_one_result = process_one(
+            let process_one_df = process_one(
                 range,
                 &mut handle,
                 schema,
@@ -1109,14 +1065,13 @@ impl LazyLogFmtReader {
                 &mut df_maker,
                 &mut buf,
                 use_df_maker,
-                i == ranges.len() - 1,
-            );
+                &mut capped,
+            )?;
 
-            let process_one_df = process_one_result?;
             if !use_df_maker && process_one_df.is_none() {
                 continue;
             }
-            if use_df_maker && i != ranges.len() - 1 {
+            if use_df_maker && i != ranges.len() - 1 && !capped {
                 continue;
             }
 
@@ -1131,79 +1086,16 @@ impl LazyLogFmtReader {
             // stays empty unless `aligned_cols_cnt` is set. A 0-column frame is
             // discarded by the caller, which then falls back to the single-threaded
             // path; applying the pushed-down predicate/projection to it would fail.
-            if use_df_maker && df.width() > 0 {
-                if let Some(pred) = &predicate {
-                    use polars::prelude::IntoLazy;
-                    df = df.lazy().filter(pred.clone()).collect().map_err(
-                        |e: polars::error::PolarsError| {
-                            polars::error::PolarsError::ComputeError(e.to_string().into())
-                        },
-                    )?;
-                }
-                if let Some(cols) = with_columns
-                    && !cols.is_empty()
-                {
-                    df = df.select(cols)?;
-                }
+            if use_df_maker && df.width() > 0 && row_cap.is_none() {
+                df = apply_pushdown(df, predicate.as_ref(), with_columns)?;
             }
 
-            if let Some(counter) = &counter {
-                let parsed = df.height();
-                if parsed == 0 {
-                    continue;
-                }
-                // Try to claim allowed rows for this frame. If batch_size is None,
-                // treat as unlimited and allow all parsed rows.
-                loop {
-                    let prev = counter.load(Ordering::SeqCst);
-                    if let Some(bs) = batch_size {
-                        if prev >= bs {
-                            // nothing allowed
-                            df = DataFrame::default();
-                            break;
-                        }
-                        let allowed = std::cmp::min(parsed, bs.saturating_sub(prev));
-                        match counter.compare_exchange(
-                            prev,
-                            prev + allowed,
-                            Ordering::SeqCst,
-                            Ordering::SeqCst,
-                        ) {
-                            Ok(_) => {
-                                if allowed < parsed {
-                                    df = df.slice(0, allowed);
-                                }
-                                break;
-                            }
-                            Err(_) => continue,
-                        }
-                    } else {
-                        // unlimited: claim all parsed rows
-                        match counter.compare_exchange(
-                            prev,
-                            prev + parsed,
-                            Ordering::SeqCst,
-                            Ordering::SeqCst,
-                        ) {
-                            Ok(_) => break,
-                            Err(_) => continue,
-                        }
-                    }
-                }
-            }
             if df.width() > 0 && df.height() > 0 {
                 parts.push(df);
             }
-            if let Some(counter) = &counter
-                && let Some(stop) = &stop_flag
-                && let Some(bs) = batch_size
-                && counter.load(Ordering::SeqCst) >= bs
-            {
-                stop.store(true, Ordering::SeqCst);
+            if capped {
                 break;
             }
-
-            // reuse the provided handle
         }
 
         if parts.is_empty() {
@@ -1380,6 +1272,28 @@ impl LazyLogFmtReader {
     }
 }
 
+/// Apply the pushed-down predicate and projection to a batch, in that order.
+fn apply_pushdown(
+    mut df: DataFrame,
+    predicate: Option<&Expr>,
+    with_columns: Option<&Vec<String>>,
+) -> PolarsResult<DataFrame> {
+    if let Some(pred) = predicate {
+        use polars::prelude::IntoLazy;
+        df = df
+            .lazy()
+            .filter(pred.clone())
+            .collect()
+            .map_err(|e| polars::error::PolarsError::ComputeError(e.to_string().into()))?;
+    }
+    if let Some(cols) = with_columns
+        && !cols.is_empty()
+    {
+        df = df.select(cols)?;
+    }
+    Ok(df)
+}
+
 pub enum Mode {
     PerColumn,
     Columner,
@@ -1414,6 +1328,8 @@ impl DataFrameMakerBuilder {
             mode: self.mode,
             n_rows_hint: None,
             column_infos: Vec::<ColumnInfo>::new(),
+            row_seen: Vec::<usize>::new(),
+            rows_pushed: 0,
             array_i64s: Vec::<
                 polars_core::prelude::PrimitiveChunkedBuilder<polars::prelude::Int64Type>,
             >::new(),
@@ -1467,6 +1383,9 @@ struct DataFrameMaker {
     n_rows_hint: Option<usize>,
     // using mutable index mode
     column_infos: Vec<ColumnInfo>,
+    // per `column_infos` entry: id (`rows_pushed + 1`) of the last row that carried it
+    row_seen: Vec<usize>,
+    rows_pushed: usize,
     array_i64s: Vec<PrimitiveChunkedBuilder<polars::prelude::Int64Type>>,
     array_timestamps: Vec<PrimitiveChunkedBuilder<polars::prelude::Int64Type>>,
     array_duration: Vec<PrimitiveChunkedBuilder<polars::prelude::Int64Type>>,
@@ -1511,6 +1430,10 @@ impl DataFrameMaker {
 
     fn push_line_to_column_mutable_array(&mut self, line: &str) {
         let column_info = &mut self.column_infos;
+        let row_seen = &mut self.row_seen;
+        // this row's id in `row_seen`; 0 is "never seen"
+        let row_id = self.rows_pushed + 1;
+        let mut hits = 0usize;
         let array_i64s = &mut self.array_i64s;
         let array_f64s = &mut self.array_f64s;
         let array_bools = &mut self.array_bools;
@@ -1523,8 +1446,8 @@ impl DataFrameMaker {
                 return;
             }
 
-            let col_info: &ColumnInfo = match column_info.iter().find(|ci| ci.name == key) {
-                Some(ci) => ci,
+            let pos = match column_info.iter().position(|ci| ci.name == key) {
+                Some(pos) => pos,
                 None => {
                     let mut ci = match self.schema.as_ref().and_then(|s| s.get(key)).copied() {
                         Some(SchemaField::String) => ColumnInfo {
@@ -1575,9 +1498,13 @@ impl DataFrameMaker {
                     );
                     ci.index = idx;
                     column_info.push(ci);
-                    column_info.last().unwrap()
+                    row_seen.push(0);
+                    column_info.len() - 1
                 }
             };
+            row_seen[pos] = row_id;
+            hits += 1;
+            let col_info = &column_info[pos];
 
             match col_info.data_type {
                 DataType::Int64 => {
@@ -1620,6 +1547,50 @@ impl DataFrameMaker {
                 }
             };
         });
+
+        // a column the line did not carry is null on this row
+        if hits < column_info.len() {
+            for (seen, ci) in row_seen.iter().zip(column_info.iter()) {
+                if *seen != row_id {
+                    DataFrameMaker::append_null_to_column_array(
+                        array_i64s,
+                        array_f64s,
+                        array_bools,
+                        array_timestamps,
+                        array_duration,
+                        array_strings,
+                        ci,
+                    );
+                }
+            }
+        }
+        self.rows_pushed = row_id;
+    }
+
+    /// Append a null to the builder of `ci`. Kept out of line: it runs only
+    /// for ragged rows and would otherwise weigh on the per-key closure.
+    #[cold]
+    #[inline(never)]
+    fn append_null_to_column_array(
+        array_i64s: &mut [PrimitiveChunkedBuilder<polars::prelude::Int64Type>],
+        array_f64s: &mut [PrimitiveChunkedBuilder<polars::prelude::Float64Type>],
+        array_bools: &mut [BooleanChunkedBuilder],
+        array_timestamps: &mut [PrimitiveChunkedBuilder<polars::prelude::Int64Type>],
+        array_duration: &mut [PrimitiveChunkedBuilder<polars::prelude::Int64Type>],
+        array_strings: &mut [StringChunkedBuilder],
+        ci: &ColumnInfo,
+    ) {
+        match ci.data_type {
+            DataType::Int64 => array_i64s[ci.index].append_null(),
+            DataType::Float64 => array_f64s[ci.index].append_null(),
+            DataType::Boolean => array_bools[ci.index].append_null(),
+            DataType::Datetime(TimeUnit::Microseconds, None) => {
+                array_timestamps[ci.index].append_null()
+            }
+            DataType::Duration(TimeUnit::Microseconds) => array_duration[ci.index].append_null(),
+            DataType::String => array_strings[ci.index].append_null(),
+            _ => {}
+        }
     }
     #[allow(dead_code)]
     fn append_column_arrays(&mut self, ci: &ColumnInfo) -> usize {
@@ -1796,6 +1767,7 @@ impl DataFrameMaker {
                                 ),
                             )
                             .finish()
+                            .into_datetime(TimeUnit::Microseconds, None)
                             .into_series(),
                         )
                     }
