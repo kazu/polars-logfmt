@@ -1,7 +1,7 @@
 use crate::SeekableVfs;
 use crate::lazy::{
-    LineFilterFn, LogFmtReaderState, LogFmtSource, RowFilter, infer_schema_from_row,
-    infer_schema_from_source, lock_seekable, logfmt_schema_to_polars_schema,
+    LineFilterFn, LineReader, LogFmtReaderState, LogFmtSource, RowFilter, infer_schema_from_reader,
+    infer_schema_from_row, infer_schema_from_source, lock_seekable, logfmt_schema_to_polars_schema,
     rows_to_dataframe_filled, ssh_reader,
 };
 use crate::logfmt::{ParsedValue, Row, Schema, SchemaField};
@@ -51,7 +51,13 @@ pub struct LazyLogFmtReader {
     pub reader_state: Arc<Mutex<LogFmtReaderState>>,
     pub n_threads: Option<usize>,
     pub use_parallel: bool,
+    /// Rows read to infer the schema when none is given.
+    pub infer_schema_length: usize,
 }
+
+/// Rows read to infer the schema when neither the caller nor polars gives a
+/// number: the first accepted line only.
+pub const DEFAULT_INFER_SCHEMA_LENGTH: usize = 1;
 
 #[allow(dead_code)]
 fn assert_send_sync<T: Send + Sync>() {}
@@ -63,17 +69,22 @@ impl AnonymousScan for LazyLogFmtReader {
     fn scan(&self, scan_opts: AnonymousScanArgs) -> PolarsResult<DataFrame> {
         LazyLogFmtReader::debug_scan_opts(true, &scan_opts);
 
+        // The probe stream to continue from: left by `scan_logfmt` for the
+        // first collect, or opened here when no schema was given.
+        let mut probe = self.lock_state().reader.take();
         let _schema = if let Some(ref schema) = self.schema {
             schema.clone()
         } else {
-            let schema_opt = infer_schema_from_source(
+            let (schema_opt, probe_opt) = infer_schema_from_source(
                 &self.source,
                 &self.cmd,
                 self.line_filter.clone(),
+                self.infer_schema_length,
                 crate::ssh::connect_ssh,
                 ssh_reader,
             )
             .map_err(|e| polars::error::PolarsError::ComputeError(e.to_string().into()))?;
+            probe = probe_opt;
             if let Some(s) = schema_opt {
                 s
             } else {
@@ -85,6 +96,7 @@ impl AnonymousScan for LazyLogFmtReader {
         let scan_reader = self
             .clone_with_fresh_handle()?
             .set_schema_opt(Some(_schema));
+        scan_reader.lock_state().reader = probe;
         tracing::debug!(with_columns = ?scan_opts.with_columns, "scan with_columns");
 
         let mut acc: Option<DataFrame> = None;
@@ -140,8 +152,10 @@ impl AnonymousScan for LazyLogFmtReader {
         Ok(out_df)
     }
 
-    fn schema(&self, _infer_schema_length: Option<usize>) -> PolarsResult<SchemaRef> {
-        tracing::debug!(infer_schema_length = ?_infer_schema_length, "schema requested");
+    /// `infer_schema_length` from polars wins over the reader's own value.
+    fn schema(&self, infer_schema_length: Option<usize>) -> PolarsResult<SchemaRef> {
+        tracing::debug!(infer_schema_length = ?infer_schema_length, "schema requested");
+        let infer_schema_length = infer_schema_length.unwrap_or(self.infer_schema_length);
         if let Some(ref schema) = self.schema {
             use polars::prelude::{DataType, Field, Schema};
             let mut fields = Vec::new();
@@ -162,21 +176,22 @@ impl AnonymousScan for LazyLogFmtReader {
             let schema = Schema::from_iter_check_duplicates(fields)?;
             Ok(Arc::new(schema))
         } else {
-            // let mut schema = self.schema.as_ref().cloned();
-            // try to predict a logfmt schema from the first line and convert it to a polars Schema
-
             // Seekable sources are probed through a cloned handle; ssh and cursor
-            // sources fall back to reading the first line from the stream.
-            let pred_schema = match self.predict_schema_from_first_line()? {
+            // sources fall back to reading the first lines from the stream.
+            let pred_schema = match self.predict_schema_from_first_line(infer_schema_length)? {
                 Some(s) => Some(s),
-                None => infer_schema_from_source(
-                    &self.source,
-                    &self.cmd,
-                    self.line_filter.clone(),
-                    crate::ssh::connect_ssh,
-                    ssh_reader,
-                )
-                .map_err(|e| polars::error::PolarsError::ComputeError(e.to_string().into()))?,
+                None => {
+                    infer_schema_from_source(
+                        &self.source,
+                        &self.cmd,
+                        self.line_filter.clone(),
+                        infer_schema_length,
+                        crate::ssh::connect_ssh,
+                        ssh_reader,
+                    )
+                    .map_err(|e| polars::error::PolarsError::ComputeError(e.to_string().into()))?
+                    .0
+                }
             };
             if let Some(pred_schema) = pred_schema {
                 let polars_schema = logfmt_schema_to_polars_schema(&pred_schema);
@@ -225,6 +240,14 @@ impl LazyLogFmtReader {
         //String::new()
     }
 
+    /// A poisoned lock is recovered: the state is a reader position that
+    /// stays usable.
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, LogFmtReaderState> {
+        self.reader_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn max_inflight(&self) -> usize {
         match self.n_threads {
             Some(n_trhreads) => n_trhreads,
@@ -241,7 +264,10 @@ impl LazyLogFmtReader {
         self.schema = Some(schema);
     }
 
-    fn predict_schema_from_first_line(&self) -> PolarsResult<Option<Schema>> {
+    fn predict_schema_from_first_line(
+        &self,
+        infer_schema_length: usize,
+    ) -> PolarsResult<Option<Schema>> {
         // extract the inner Arc<Mutex<...>> when source is Seekable
         let file_arc = match &self.source {
             LogFmtSource::Seekable(file_arc) => file_arc,
@@ -267,44 +293,22 @@ impl LazyLogFmtReader {
         }
 
         // Delegate to the handle-based helper and return its result.
-        self.predict_schema_from_first_line_handle(probe)
+        self.predict_schema_from_first_line_handle(probe, infer_schema_length)
     }
 
     fn predict_schema_from_first_line_handle(
         &self,
         probe: Box<dyn crate::SeekableVfsFile + Send>,
+        infer_schema_length: usize,
     ) -> PolarsResult<Option<Schema>> {
         let mut br = BufReader::new(probe);
-        let mut lines = 0usize;
-        let mut first_row: Option<Row> = None;
-        loop {
-            let mut line = String::new();
-            let n = br.read_line(&mut line).map_err(|e: std::io::Error| {
-                polars::error::PolarsError::ComputeError(e.to_string().into())
-            })?;
-            if n == 0 || lines >= 100 {
-                break;
-            }
-            if line.trim().is_empty() {
-                continue;
-            }
-            if let Some(filter) = self.line_filter.as_ref()
-                && !filter(&line)
-            {
-                continue;
-            }
-
-            let r = crate::logfmt::parse_logfmt_line(&line);
-            if first_row.is_none() {
-                first_row = Some(r.clone());
-            }
-            lines += 1;
-        }
-        if let Some(fr) = first_row {
-            Ok(Some(infer_schema_from_row(&fr)))
-        } else {
-            Ok(None)
-        }
+        infer_schema_from_reader(
+            &mut br,
+            self.line_filter.as_ref(),
+            infer_schema_length,
+            &mut Vec::new(),
+        )
+        .map_err(|e| polars::error::PolarsError::ComputeError(e.to_string().into()))
     }
 
     fn parallel_batch(
@@ -367,7 +371,8 @@ impl LazyLogFmtReader {
 
         // optional single-thread schema inference (extracted to helper)
         if schema.is_none()
-            && let Some(pred) = self.predict_schema_from_first_line_handle(probe)?
+            && let Some(pred) =
+                self.predict_schema_from_first_line_handle(probe, self.infer_schema_length)?
         {
             *schema = Some(pred);
         }
@@ -527,10 +532,7 @@ impl LazyLogFmtReader {
         let mut schema = self.schema.as_ref().cloned();
         let line_filter = self.line_filter.clone();
         let row_filter = self.row_filter.as_ref();
-        let mut state = self
-            .reader_state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = self.lock_state();
 
         tracing::debug!(
             state_finish = state.finished,
@@ -577,7 +579,6 @@ impl LazyLogFmtReader {
         row_filter: Option<&RowFilter>,
         state: &mut LogFmtReaderState,
     ) -> PolarsResult<Option<DataFrame>> {
-        use std::io::BufRead;
         // Only attempt when source is Seekable
         tracing::debug!(
             batch_size = ?batch_size,
@@ -585,7 +586,7 @@ impl LazyLogFmtReader {
             "single_bacth entry",
         );
         if state.reader.is_none() {
-            let reader: Box<dyn BufRead + Send> = match &self.source {
+            let reader: LineReader = match &self.source {
                 LogFmtSource::Cursor(cursor) => {
                     let mut c = cursor.clone();
                     c.set_position(0);
@@ -606,7 +607,6 @@ impl LazyLogFmtReader {
                     reader
                 }
                 LogFmtSource::Seekable(file_arc) => {
-                    use std::io::BufRead;
                     let file_opt = lock_seekable(file_arc);
                     let Some(file) = file_opt.as_ref() else {
                         polars::error::polars_bail!(ComputeError: "SeekableVfsFile missing");
@@ -616,7 +616,7 @@ impl LazyLogFmtReader {
                             format!("SeekableVfsFile clone failed: {e}").into(),
                         )
                     })?;
-                    Box::new(std::io::BufReader::new(cloned_file)) as Box<dyn BufRead + Send>
+                    Box::new(std::io::BufReader::new(cloned_file)) as LineReader
                 }
             };
             state.reader = Some(reader);
@@ -626,7 +626,8 @@ impl LazyLogFmtReader {
 
         // If no schema yet, try to predict it from a cloned seekable handle.
         if schema.is_none()
-            && let Some(pred_schema) = self.predict_schema_from_first_line()?
+            && let Some(pred_schema) =
+                self.predict_schema_from_first_line(self.infer_schema_length)?
         {
             *schema = Some(pred_schema);
         }
@@ -747,6 +748,7 @@ impl LazyLogFmtReader {
             .batch_size(self.batch_size)
             .aligned_cols_cnt(self.aligned_cols_cnt)
             .n_threads(self.n_threads)
+            .infer_schema_length(self.infer_schema_length)
             .cmd(self.cmd.clone())
             .row_filter(self.row_filter.clone())
             .schema(self.schema.clone())
@@ -1227,39 +1229,34 @@ impl LazyLogFmtReader {
         use std::sync::Arc;
         // Infer the schema once here. Otherwise polars asks `schema()` and then
         // `scan()` infers again, which for an ssh command source means one extra
-        // connection per collect.
+        // connection per collect. The probe stream is kept in `reader_state`
+        // for the first `scan()` to continue from.
         if self.schema.is_none() {
-            self.schema = Some(
-                infer_schema_from_source(
-                    &self.source,
-                    &self.cmd,
-                    self.line_filter.clone(),
-                    crate::ssh::connect_ssh,
-                    ssh_reader,
+            let (schema, probe) = infer_schema_from_source(
+                &self.source,
+                &self.cmd,
+                self.line_filter.clone(),
+                self.infer_schema_length,
+                crate::ssh::connect_ssh,
+                ssh_reader,
+            )
+            .map_err(|e| polars::error::PolarsError::ComputeError(e.to_string().into()))?;
+            self.schema = Some(schema.ok_or_else(|| {
+                polars::error::PolarsError::ComputeError(
+                    "no logfmt line found in the source; pass a schema to scan an empty source"
+                        .into(),
                 )
-                .map_err(|e| polars::error::PolarsError::ComputeError(e.to_string().into()))?
-                .ok_or_else(|| {
-                    polars::error::PolarsError::ComputeError(
-                        "no logfmt line found in the source; pass a schema to scan an empty source"
-                            .into(),
-                    )
-                })?,
-            );
+            })?);
+            self.lock_state().reader = probe;
         }
         let schema = self.schema.clone();
 
-        let scan_args = if schema.is_none() {
-            ScanArgsAnonymous {
-                ..Default::default()
-            }
-        } else {
-            ScanArgsAnonymous {
-                schema: schema.map(|s| Arc::new(logfmt_schema_to_polars_schema(&s))),
-                ..Default::default()
-            }
+        let scan_args = ScanArgsAnonymous {
+            schema: schema.map(|s| Arc::new(logfmt_schema_to_polars_schema(&s))),
+            ..Default::default()
         };
 
-        LazyFrame::anonymous_scan(Arc::new(self.with_fresh_state()?), scan_args)
+        LazyFrame::anonymous_scan(Arc::new(self), scan_args)
     }
     pub fn scan(self) -> Result<LazyFrame, polars::error::PolarsError> {
         self.scan_logfmt()
@@ -2145,6 +2142,7 @@ pub struct LazyLogFmtReaderBuilder {
     aligned_cols_cnt: bool,
     n_threads: Option<usize>,
     use_parallel: bool,
+    infer_schema_length: usize,
 }
 
 impl Clone for LazyLogFmtReaderBuilder {
@@ -2159,6 +2157,7 @@ impl Clone for LazyLogFmtReaderBuilder {
             aligned_cols_cnt: self.aligned_cols_cnt,
             n_threads: self.n_threads,
             use_parallel: true,
+            infer_schema_length: self.infer_schema_length,
         }
     }
 }
@@ -2175,6 +2174,7 @@ impl LazyLogFmtReaderBuilder {
             aligned_cols_cnt: false,
             n_threads: None,
             use_parallel: true,
+            infer_schema_length: DEFAULT_INFER_SCHEMA_LENGTH,
         }
     }
 
@@ -2241,6 +2241,13 @@ impl LazyLogFmtReaderBuilder {
 
     pub fn n_threads(mut self, n: Option<usize>) -> Self {
         self.n_threads = n;
+        self
+    }
+
+    /// Rows read to infer the schema when none is given; how their types
+    /// combine is described on [`crate::LogfmtScanOpts::infer_schema_length`].
+    pub fn infer_schema_length(mut self, n: usize) -> Self {
+        self.infer_schema_length = n;
         self
     }
 
@@ -2316,6 +2323,7 @@ impl LazyLogFmtReaderBuilder {
             })),
             n_threads,
             use_parallel: self.use_parallel,
+            infer_schema_length: self.infer_schema_length,
         })
     }
 }
