@@ -174,6 +174,132 @@ fn limit_then_filter_takes_the_first_n_raw_rows() {
     assert_eq!(n, [Some(2), Some(4), Some(6)]);
 }
 
+/// `write_big` compressed into several 64 KiB seekable frames.
+fn write_big_zst(dir: &tempfile::TempDir) -> PathBuf {
+    let plain = write_big(dir);
+    common::write_zst(dir, &plain, "big.logfmt.zst")
+}
+
+fn aligned() -> LogfmtScanOpts {
+    LogfmtScanOpts {
+        aligned_cols_cnt: true,
+        ..Default::default()
+    }
+}
+
+fn n_values(df: &polars::prelude::DataFrame) -> Vec<Option<i64>> {
+    df.column("n")
+        .expect("n")
+        .i64()
+        .expect("i64")
+        .iter()
+        .collect()
+}
+
+#[test]
+fn aligned_batch_size_does_not_cap_collect() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    for path in [write_big(&dir), write_big_zst(&dir)] {
+        let opts = LogfmtScanOpts {
+            batch_size: Some(300),
+            ..aligned()
+        };
+        let df = scan_logfmt(as_str(&path), &opts)
+            .expect("scan")
+            .collect()
+            .expect("collect");
+        assert_eq!(df.height(), 20_000, "{}", path.display());
+    }
+}
+
+#[test]
+fn aligned_limit_returns_n_distinct_rows() {
+    // The parallel scan promises `n` raw rows of the file, not its first `n`:
+    // the workers claim rows from a shared pool and all stop once it is empty.
+    let dir = tempfile::tempdir().expect("tempdir");
+    for path in [write_big(&dir), write_big_zst(&dir)] {
+        let df = scan_logfmt(as_str(&path), &aligned())
+            .expect("scan")
+            .limit(2)
+            .collect()
+            .expect("collect");
+        let n = n_values(&df);
+        assert_eq!(n.len(), 2, "{}", path.display());
+        assert_ne!(n[0], n[1], "{}", path.display());
+        for v in n {
+            let v = v.expect("n is never null");
+            assert!((1..=20_000).contains(&v), "{}: n={v}", path.display());
+        }
+    }
+}
+
+#[test]
+fn aligned_limit_then_filter_filters_the_n_raw_rows() {
+    // `limit(3).filter(..)` pushes both into the scan: three raw rows are
+    // claimed, then the predicate runs on them, so at most three error rows.
+    let dir = tempfile::tempdir().expect("tempdir");
+    for path in [write_big(&dir), write_big_zst(&dir)] {
+        let df = scan_logfmt(as_str(&path), &aligned())
+            .expect("scan")
+            .limit(3)
+            .filter(col("level").eq(lit("error")))
+            .collect()
+            .expect("collect");
+        let n = n_values(&df);
+        assert!(n.len() <= 3, "{}: {n:?}", path.display());
+        assert!(
+            n.iter().all(|v| v.expect("n is never null") % 2 == 0),
+            "{}: {n:?}",
+            path.display()
+        );
+
+        let df = scan_logfmt(as_str(&path), &aligned())
+            .expect("scan")
+            .filter(col("level").eq(lit("error")))
+            .limit(3)
+            .collect()
+            .expect("collect");
+        assert_eq!(
+            n_values(&df),
+            [Some(2), Some(4), Some(6)],
+            "{}",
+            path.display()
+        );
+    }
+}
+
+#[test]
+fn aligned_ragged_row_gets_null() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = common::write_plain(
+        &dir,
+        "ragged.logfmt",
+        b"level=info msg=start n=1\nlevel=error msg=boom\nlevel=info msg=done n=3\n",
+    );
+    let df = scan_logfmt(as_str(&path), &aligned())
+        .expect("scan")
+        .collect()
+        .expect("collect");
+    assert_eq!(n_values(&df), [Some(1), None, Some(3)]);
+}
+
+#[test]
+fn aligned_datetime_column_is_datetime() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = write_zst(&dir);
+    let opts: LogfmtScanOpts =
+        serde_json::from_str(r#"{"aligned_cols_cnt": true, "schema": {"ts": "datetime"}}"#)
+            .expect("deserialize opts");
+    let df = scan_logfmt(as_str(&path), &opts)
+        .expect("scan")
+        .collect()
+        .expect("collect");
+    assert_eq!(
+        df.column("ts").expect("ts").dtype(),
+        &DataType::Datetime(polars::prelude::TimeUnit::Microseconds, None)
+    );
+}
+
 #[test]
 fn unknown_json_field_is_an_error() {
     let err = serde_json::from_str::<LogfmtScanOpts>(r#"{"line_fliter": "n=1"}"#)

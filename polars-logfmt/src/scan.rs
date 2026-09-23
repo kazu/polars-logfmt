@@ -39,7 +39,8 @@ pub struct LogfmtScanOpts {
     /// `aligned_cols_cnt` is set; otherwise the file is read single-threaded.
     pub n_threads: Option<usize>,
     /// Use the key set of the first accepted line as the column list and read
-    /// the file frame-parallel. Every line must then carry those keys.
+    /// the file frame-parallel. A key missing from a later line is null there;
+    /// a key the first line did not have is dropped.
     pub aligned_cols_cnt: bool,
     /// Remote command for an `ssh://` source, for example `cat /var/log/app.log`.
     /// When set, the file is streamed through an ssh channel running this
