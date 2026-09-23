@@ -12,9 +12,12 @@ test = false
 doctest = false
 
 [dependencies]
-nu_plugin_polars_dyn = { git = "https://github.com/kazu/nu_plugin_polars_dyn", branch = "main" }
+# crates.io form, so that nu-polars-dyn-build's `[patch.crates-io]` resolves it to the one copy
+# the generated project uses. This crate is built through that builder, not on its own.
+nu_plugin_polars_dyn = "0.2"
 polars_logfmt = { path = "../polars-logfmt" }
 polars = "=0.55.2"
+memchr = "=2.8.0"
 serde_json = "=1.0.151"
 
 [lints.clippy]
