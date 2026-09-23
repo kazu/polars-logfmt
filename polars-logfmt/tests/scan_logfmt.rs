@@ -300,6 +300,129 @@ fn aligned_datetime_column_is_datetime() {
     );
 }
 
+/// `n` is Integer on the first line, Float on the third; `level` is String
+/// throughout; `extra` first appears on the third line.
+const MIXED: &str = "level=info n=1\nlevel=error n=2\nlevel=info n=1.5 extra=x\n";
+
+fn write_mixed(dir: &tempfile::TempDir) -> PathBuf {
+    common::write_plain(dir, "mixed.logfmt", MIXED.as_bytes())
+}
+
+#[test]
+fn default_infer_schema_length_uses_the_first_line_only() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = write_mixed(&dir);
+    let mut lf = scan_logfmt(as_str(&path), &LogfmtScanOpts::default()).expect("scan");
+    let schema = lf.collect_schema().expect("schema");
+    assert_eq!(schema.get("n"), Some(&DataType::Int64));
+    assert!(schema.get("extra").is_none());
+}
+
+#[test]
+fn infer_schema_length_widens_types_and_adds_late_keys() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = write_mixed(&dir);
+    let opts: LogfmtScanOpts =
+        serde_json::from_str(r#"{"infer_schema_length": 3}"#).expect("deserialize opts");
+    let mut lf = scan_logfmt(as_str(&path), &opts).expect("scan");
+    let schema = lf.collect_schema().expect("schema");
+    assert_eq!(schema.get("n"), Some(&DataType::Float64));
+    assert_eq!(schema.get("level"), Some(&DataType::String));
+    assert_eq!(schema.get("extra"), Some(&DataType::String));
+    let df = lf.collect().expect("collect");
+    assert_eq!(df.height(), 3);
+    let n = df.column("n").expect("n").f64().expect("f64");
+    assert_eq!(n.get(2), Some(1.5));
+}
+
+#[test]
+fn infer_schema_length_counts_lines_after_the_line_filter() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = write_mixed(&dir);
+    // Two accepted lines: `n=1` and `n=1.5`. The rejected `level=error` line
+    // does not count, so 2 reaches the Float line.
+    let opts = LogfmtScanOpts {
+        line_filter: Some("level=info".into()),
+        infer_schema_length: Some(2),
+        ..Default::default()
+    };
+    let mut lf = scan_logfmt(as_str(&path), &opts).expect("scan");
+    let schema = lf.collect_schema().expect("schema");
+    assert_eq!(schema.get("n"), Some(&DataType::Float64));
+}
+
+#[test]
+fn polars_infer_schema_length_wins_over_the_reader_value() {
+    use polars::prelude::AnonymousScan;
+    use polars_logfmt::lazy::LazyLogFmtReaderBuilder;
+    let reader = LazyLogFmtReaderBuilder::new()
+        .from_cursor(std::io::Cursor::new(MIXED.as_bytes().to_vec()))
+        .infer_schema_length(1)
+        .build()
+        .expect("build");
+    let schema = AnonymousScan::schema(&reader, Some(3)).expect("schema");
+    assert_eq!(schema.get("n"), Some(&DataType::Float64));
+    let schema = AnonymousScan::schema(&reader, None).expect("schema");
+    assert_eq!(schema.get("n"), Some(&DataType::Int64));
+}
+
+/// The probe stream left in `reader_state` feeds the first collect and only
+/// that one; the next collect reads the source again.
+#[test]
+fn first_collect_continues_from_the_stashed_probe_stream() {
+    use polars_logfmt::lazy::LazyLogFmtReaderBuilder;
+    let source = std::io::Cursor::new(b"n=1\nn=2\n".to_vec());
+    let stashed: polars_logfmt::lazy::LineReader =
+        Box::new(std::io::Cursor::new(b"n=10\nn=20\nn=30\n".to_vec()));
+    let reader = LazyLogFmtReaderBuilder::new()
+        .from_cursor(source)
+        .schema(Some([("n".to_string(), SchemaField::Integer)].into()))
+        .build()
+        .expect("build");
+    reader.reader_state.lock().expect("lock").reader = Some(stashed);
+    let lf = reader.scan_logfmt().expect("scan");
+    let first = lf.clone().collect().expect("first collect");
+    assert_eq!(n_values(&first), [Some(10), Some(20), Some(30)]);
+    let second = lf.collect().expect("second collect");
+    assert_eq!(n_values(&second), [Some(1), Some(2)]);
+}
+
+/// Runs only with `--ignored` and `POLARS_LOGFMT_TEST_SSH=ssh://user@host[:port]/dir`.
+/// The command prints `MIXED`, so no remote file is needed. All three lines
+/// were consumed by the probe and must still come out of the scan.
+#[test]
+#[ignore = "needs POLARS_LOGFMT_TEST_SSH"]
+fn ssh_cmd_scan_continues_on_the_probe_connection() {
+    let base = std::env::var("POLARS_LOGFMT_TEST_SSH")
+        .expect("set POLARS_LOGFMT_TEST_SSH=ssh://user@host/dir");
+    let opts = LogfmtScanOpts {
+        cmd: Some(format!("printf '{}'", MIXED.replace('\n', "\\n"))),
+        infer_schema_length: Some(3),
+        ..Default::default()
+    };
+    let df = scan_logfmt(&base, &opts)
+        .expect("scan")
+        .collect()
+        .expect("collect");
+    assert_eq!(df.height(), 3);
+    let n = df.column("n").expect("n").f64().expect("f64");
+    assert_eq!(n.get(2), Some(1.5));
+}
+
+#[test]
+fn infer_schema_length_zero_is_an_error() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = write_mixed(&dir);
+    let opts = LogfmtScanOpts {
+        infer_schema_length: Some(0),
+        ..Default::default()
+    };
+    let err = scan_logfmt(as_str(&path), &opts)
+        .err()
+        .expect("scan should fail");
+    assert!(err.to_string().contains("no logfmt line"), "{err}");
+}
+
 #[test]
 fn unknown_json_field_is_an_error() {
     let err = serde_json::from_str::<LogfmtScanOpts>(r#"{"line_fliter": "n=1"}"#)
@@ -330,6 +453,44 @@ fn empty_file_without_schema_is_an_error_not_a_panic() {
         .err()
         .expect("scan should fail");
     assert!(err.to_string().contains("no logfmt line"), "{err}");
+}
+
+fn full_schema() -> LogfmtScanOpts {
+    LogfmtScanOpts {
+        schema: Some(
+            [
+                ("level".to_string(), SchemaField::String),
+                ("n".to_string(), SchemaField::Integer),
+            ]
+            .into(),
+        ),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn empty_file_with_a_full_schema_reads_nothing_and_collects_no_rows() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("empty.logfmt");
+    std::fs::write(&path, "").expect("write empty fixture");
+    let df = scan_logfmt(as_str(&path), &full_schema())
+        .expect("scan must not probe")
+        .collect()
+        .expect("collect");
+    assert_eq!(df.height(), 0);
+}
+
+#[test]
+fn ssh_cmd_with_a_full_schema_connects_only_at_collect() {
+    let opts = LogfmtScanOpts {
+        cmd: Some("cat /var/log/app.logfmt".into()),
+        ..full_schema()
+    };
+    let lf = scan_logfmt("ssh://nobody@127.0.0.1:1/var/log/app.logfmt", &opts)
+        .expect("scan must not connect");
+    let err = lf.collect().expect_err("collect should fail");
+    let msg = err.to_string();
+    assert!(msg.contains("connect") || msg.contains("refused"), "{msg}");
 }
 
 #[test]

@@ -1,12 +1,13 @@
 pub mod lazy_logfmt_reader;
 mod logfmt_reader_state;
 use crate::ssh::SshStream;
+pub use lazy_logfmt_reader::DEFAULT_INFER_SCHEMA_LENGTH;
 pub use lazy_logfmt_reader::LazyFrameFn;
 pub use lazy_logfmt_reader::LazyLogFmtReader;
 pub use lazy_logfmt_reader::LazyLogFmtReaderBuilder;
 pub use logfmt_reader_state::LogFmtReaderState;
 
-use crate::logfmt::{Row, Schema};
+use crate::logfmt::{Row, Schema, SchemaField};
 
 use crate::ssh::SshSource;
 use anyhow::Result;
@@ -16,70 +17,42 @@ use polars::prelude::DataFrame;
 // use zstd::stream::Decoder; // only used in ssh_reader
 
 // use std::collections::BTreeSet; // 未使用
-use std::io::{BufRead, Cursor};
+use std::io::{BufRead, Cursor, Read};
 use std::sync::Arc;
 
-/// line_filterを通過した最初の行からschemaを推定する
-type SshReaderFn =
-    fn(SshStream, bool) -> anyhow::Result<(SshStream, Box<dyn std::io::BufRead + Send>)>;
+/// The stream a scan reads lines from.
+pub type LineReader = Box<dyn BufRead + Send>;
+type SshReaderFn = fn(SshStream, bool) -> anyhow::Result<(SshStream, LineReader)>;
+/// Infer the schema from the first `infer_schema_length` lines of `source`
+/// that pass `line_filter`.
+///
+/// For an ssh command source the second value is the probe stream, rewound to
+/// its first byte, so the scan can continue on the same connection instead of
+/// opening a second one. Cursor and seekable sources reopen by handle, so
+/// nothing is returned for them.
 fn infer_schema_from_source(
     source: &LogFmtSource,
     cmd: &Option<String>,
     line_filter: Option<LineFilterFn>,
+    infer_schema_length: usize,
     ssh_connect: fn(&SshSource, Option<&str>, Option<&str>, &str) -> anyhow::Result<SshStream>,
     ssh_reader: SshReaderFn,
-) -> anyhow::Result<Option<Schema>> {
-    match source {
+) -> anyhow::Result<(Option<Schema>, Option<LineReader>)> {
+    let mut reader: LineReader = match source {
         LogFmtSource::Cursor(cursor) => {
             let mut c = cursor.clone();
             c.set_position(0);
-            let mut reader = std::io::BufReader::new(c);
-            let mut line = String::new();
-            while reader.read_line(&mut line)? > 0 {
-                if line.trim().is_empty() {
-                    line.clear();
-                    continue;
-                }
-                if line_filter
-                    .as_ref()
-                    .map(|filter| !filter(&line))
-                    .unwrap_or(false)
-                {
-                    line.clear();
-                    continue;
-                }
-                let row = crate::logfmt::parse_logfmt_line(&line);
-                return Ok(Some(infer_schema_from_row(&row)));
-            }
-            Ok(None)
+            Box::new(std::io::BufReader::new(c))
         }
         LogFmtSource::Ssh(ssh_source) => {
             let real_cmd = cmd
                 .clone()
                 .unwrap_or_else(|| format!("cat {}", ssh_source.path));
             let stream = ssh_connect(ssh_source, None, None, &real_cmd)?;
-            let (_sess, mut reader) = ssh_reader(stream, ssh_source.path.ends_with(".zst"))?;
-            let mut line = String::new();
-            while reader.read_line(&mut line)? > 0 {
-                if line.trim().is_empty() {
-                    line.clear();
-                    continue;
-                }
-                if line_filter
-                    .as_ref()
-                    .map(|filter| !filter(&line))
-                    .unwrap_or(false)
-                {
-                    line.clear();
-                    continue;
-                }
-                let row = crate::logfmt::parse_logfmt_line(&line);
-                return Ok(Some(infer_schema_from_row(&row)));
-            }
-            Ok(None)
+            let (_sess, reader) = ssh_reader(stream, ssh_source.path.ends_with(".zst"))?;
+            reader
         }
         LogFmtSource::Seekable(file_arc) => {
-            use std::io::BufRead;
             let file_opt = lock_seekable(file_arc);
             let file = file_opt
                 .as_ref()
@@ -87,27 +60,76 @@ fn infer_schema_from_source(
             let cloned_file = file
                 .clone_handle()
                 .map_err(|e| anyhow::anyhow!("SeekableVfsFile clone failed: {e}"))?;
-            let mut reader =
-                Box::new(std::io::BufReader::new(cloned_file)) as Box<dyn BufRead + Send>;
-            let mut line = String::new();
-            while reader.read_line(&mut line)? > 0 {
-                if line.trim().is_empty() {
-                    line.clear();
-                    continue;
-                }
-                if line_filter
-                    .as_ref()
-                    .map(|filter| !filter(&line))
-                    .unwrap_or(false)
-                {
-                    line.clear();
-                    continue;
-                }
-                let row = crate::logfmt::parse_logfmt_line(&line);
-                return Ok(Some(infer_schema_from_row(&row)));
-            }
-            Ok(None)
+            Box::new(std::io::BufReader::new(cloned_file))
         }
+    };
+    let mut consumed = Vec::new();
+    let schema = infer_schema_from_reader(
+        &mut *reader,
+        line_filter.as_ref(),
+        infer_schema_length,
+        &mut consumed,
+    )?;
+    let probe = match source {
+        LogFmtSource::Ssh(_) => Some(Box::new(Cursor::new(consumed).chain(reader)) as LineReader),
+        LogFmtSource::Cursor(_) | LogFmtSource::Seekable(_) => None,
+    };
+    Ok((schema, probe))
+}
+
+/// Infer the schema from the first `n_rows` non-empty lines of `reader` that
+/// pass `line_filter`, merging the types with [`merge_schema_field`].
+/// `Ok(None)` when no such line exists (also when `n_rows` is 0). Every byte
+/// taken from `reader` is appended to `consumed`.
+pub(crate) fn infer_schema_from_reader(
+    reader: &mut dyn BufRead,
+    line_filter: Option<&LineFilterFn>,
+    n_rows: usize,
+    consumed: &mut Vec<u8>,
+) -> anyhow::Result<Option<Schema>> {
+    let mut schema: Option<Schema> = None;
+    let mut rows = 0usize;
+    let mut line = String::new();
+    while rows < n_rows && reader.read_line(&mut line)? > 0 {
+        consumed.extend_from_slice(line.as_bytes());
+        if line.trim().is_empty() {
+            line.clear();
+            continue;
+        }
+        if line_filter.map(|filter| !filter(&line)).unwrap_or(false) {
+            line.clear();
+            continue;
+        }
+        let row = crate::logfmt::parse_logfmt_line(&line);
+        let row_schema = infer_schema_from_row(&row);
+        schema = Some(match schema {
+            None => row_schema,
+            Some(mut merged) => {
+                for (k, v) in row_schema {
+                    merged
+                        .entry(k)
+                        .and_modify(|seen| *seen = merge_schema_field(*seen, v))
+                        .or_insert(v);
+                }
+                merged
+            }
+        });
+        rows += 1;
+        line.clear();
+    }
+    Ok(schema)
+}
+
+/// The type a column takes when two probed rows disagree: the same type
+/// stays, Integer and Float widen to Float, anything else falls back to
+/// String.
+fn merge_schema_field(a: SchemaField, b: SchemaField) -> SchemaField {
+    match (a, b) {
+        _ if a == b => a,
+        (SchemaField::Integer, SchemaField::Float) | (SchemaField::Float, SchemaField::Integer) => {
+            SchemaField::Float
+        }
+        _ => SchemaField::String,
     }
 }
 
@@ -134,10 +156,7 @@ fn logfmt_schema_to_polars_schema(
     Schema::from_iter(fields)
 }
 // SSHストリームからBufReadを返すユーティリティ
-fn ssh_reader(
-    mut stream: SshStream,
-    is_zst: bool,
-) -> anyhow::Result<(SshStream, Box<dyn std::io::BufRead + Send>)> {
+fn ssh_reader(mut stream: SshStream, is_zst: bool) -> anyhow::Result<(SshStream, LineReader)> {
     use std::io::BufReader;
     let channel = stream
         .channel

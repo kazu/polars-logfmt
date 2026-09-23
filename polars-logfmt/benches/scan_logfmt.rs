@@ -1,5 +1,6 @@
-//! Benches for the `aligned_cols_cnt` parallel scan: the per-line column
-//! builders and how the workers stop once a pushed-down `limit` is satisfied.
+//! Benches for the single-threaded scan and the `aligned_cols_cnt` parallel
+//! scan: the per-line column builders and how the workers stop once a
+//! pushed-down `limit` is satisfied.
 use criterion::{Criterion, criterion_group, criterion_main};
 use polars::prelude::{col, lit};
 use polars_logfmt::{LogfmtScanOpts, scan_logfmt};
@@ -44,6 +45,15 @@ fn bench_aligned(c: &mut Criterion) {
     let path = zst.to_str().expect("utf-8 path");
     let ragged_path = ragged.to_str().expect("utf-8 path");
 
+    // the single-threaded path: schema probe, then one reader over the file
+    c.bench_function("single_collect_zst", |b| {
+        b.iter(|| {
+            scan_logfmt(path, &LogfmtScanOpts::default())
+                .expect("scan")
+                .collect()
+                .expect("collect")
+        })
+    });
     // the null fill sits in the per-line loop even when nothing is missing
     c.bench_function("aligned_collect_zst", |b| {
         b.iter(|| {

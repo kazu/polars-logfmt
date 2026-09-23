@@ -4,7 +4,7 @@
 //! can be deserialized from JSON, so a host (for example a nushell plugin)
 //! needs no knowledge of the reader builder.
 
-use crate::lazy::LazyLogFmtReaderBuilder;
+use crate::lazy::{DEFAULT_INFER_SCHEMA_LENGTH, LazyLogFmtReaderBuilder};
 use crate::logfmt::Schema;
 use crate::ssh::SshSource;
 use polars::prelude::{LazyFrame, PolarsError, PolarsResult};
@@ -32,6 +32,12 @@ pub struct LogfmtScanOpts {
     /// `"string"`, `"integer"`, `"float"`, `"boolean"`, `"datetime"`,
     /// `"duration"` or `"auto"`. Columns not listed are inferred.
     pub schema: Option<Schema>,
+    /// Lines read to infer the schema when `schema` is not given, counted
+    /// after `line_filter`. Defaults to 1. With more lines the column types
+    /// widen: Integer and Float give Float, any other disagreement gives
+    /// String, and a key first seen in a later line is added. `0` reads
+    /// nothing and the scan fails for want of a schema.
+    pub infer_schema_length: Option<usize>,
     /// Rows per batch when the scan is pulled in batches.
     pub batch_size: Option<usize>,
     /// Worker threads for the parallel frame scan, at most 8. Defaults to the
@@ -52,8 +58,13 @@ pub struct LogfmtScanOpts {
 /// Open `source` as a lazy logfmt scan.
 ///
 /// `source` is a local path or an `ssh://user@host/path` URL. A path ending in
-/// `.zst` is read as a seekable zstd file. Nothing is read until the returned
-/// [`LazyFrame`] is collected, except the first line when no schema is given.
+/// `.zst` is read as a seekable zstd file.
+///
+/// When `opts.schema` names every column, nothing is read and no ssh command
+/// is run until the returned [`LazyFrame`] is collected; a local or SFTP path
+/// is still opened here, so a missing file fails at once. Without a schema
+/// the first `infer_schema_length` lines are read here to infer it, and for an
+/// ssh command source the first collect continues on that same connection.
 ///
 /// ```
 /// use polars_logfmt::{LogfmtScanOpts, scan_logfmt};
@@ -78,6 +89,10 @@ pub fn scan_logfmt(source: &str, opts: &LogfmtScanOpts) -> PolarsResult<LazyFram
         .batch_size(opts.batch_size)
         .n_threads(opts.n_threads)
         .aligned_cols_cnt(opts.aligned_cols_cnt)
+        .infer_schema_length(
+            opts.infer_schema_length
+                .unwrap_or(DEFAULT_INFER_SCHEMA_LENGTH),
+        )
         .schema(opts.schema.clone());
 
     if let Some(needle) = opts.line_filter.as_deref() {

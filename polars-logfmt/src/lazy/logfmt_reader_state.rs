@@ -1,8 +1,8 @@
 // LogFmtReaderState: ストリーミング状態を保持する構造体
-use std::io::BufRead;
+use crate::lazy::LineReader;
 
 pub struct LogFmtReaderState {
-    pub reader: Option<Box<dyn BufRead + Send>>, // SSH/ファイル/カーソル
-    pub offset: usize,                           // 何行読んだか
+    pub reader: Option<LineReader>, // SSH/ファイル/カーソル
+    pub offset: usize,              // 何行読んだか
     pub finished: bool,
 }
