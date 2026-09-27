@@ -8,9 +8,9 @@
 //!
 //! It ends a chain: the suffix `.logfmt` puts it last, and whatever came before — `file`, `ssh` —
 //! hands it the bytes. So `app.logfmt` and `ssh://host/var/log/app.logfmt` reach the same `scan`,
-//! which never learns where the bytes came from. It reads bytes by offset only: polars-logfmt
-//! reads the frames of a file in parallel by seeking into it, so the units of records a source such
-//! as `seek-zst` hands on are refused, and `app.logfmt.seek.zst` is not read.
+//! which never learns where the bytes came from. The units of records a source such as `seek-zst`
+//! hands on are read by number and handed to polars-logfmt as the frames it reads a file in, so
+//! `app.logfmt.seek.zst` is read by the same rules as `app.logfmt`.
 //!
 //! `--opts` under `logfmt` is `polars_logfmt::LogfmtScanOpts` as JSON, so every field may be left
 //! out and an unknown key is an error. `cmd` — a command to run over ssh — is refused: opening is
@@ -24,10 +24,10 @@
 use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::Arc;
 
-use nu_plugin_polars::scan::{Bytes, ReadAt, ReadAtCursor, ScanSource, parse_opts};
+use nu_plugin_polars::scan::{Bytes, ReadAt, ReadAtCursor, Records, ScanSource, parse_opts};
 use polars::prelude::{LazyFrame, PolarsError, PolarsResult, polars_bail};
 use polars_logfmt::lazy::{DEFAULT_INFER_SCHEMA_LENGTH, LazyLogFmtReaderBuilder};
-use polars_logfmt::{LogfmtScanOpts, SeekableVfsFile, VfsFileStat};
+use polars_logfmt::{LogfmtScanOpts, SeekableVfsFile, UnitSource, VfsFileStat};
 use serde_json::Value;
 
 /// The entry point `nu-polars-dyn-build` calls from the `main.rs` it generates.
@@ -47,13 +47,6 @@ impl ScanSource for Logfmt {
     }
 
     fn scan(&self, source: Bytes, opts: &[u8]) -> PolarsResult<LazyFrame> {
-        let Bytes::At(source) = source else {
-            polars_bail!(
-                ComputeError:
-                "`logfmt` reads its source by offset, and the one before it hands records: \
-                 a `.logfmt.seek.zst` is not read"
-            )
-        };
         let opts: LogfmtScanOpts = serde_json::from_value(Value::Object(parse_opts(opts)?))
             .map_err(|e| PolarsError::ComputeError(format!("opts: {e}").into()))?;
         if opts.cmd.is_some() {
@@ -70,8 +63,11 @@ impl ScanSource for Logfmt {
                 opts.infer_schema_length
                     .unwrap_or(DEFAULT_INFER_SCHEMA_LENGTH),
             )
-            .schema(opts.schema.clone())
-            .from_seekable_vfs_file(Box::new(ReadAtFile::new(source)));
+            .schema(opts.schema.clone());
+        builder = match source {
+            Bytes::At(source) => builder.from_seekable_vfs_file(Box::new(ReadAtFile::new(source))),
+            Bytes::Records(records) => builder.from_units(Arc::new(RecordUnits(records))),
+        };
         if let Some(needle) = opts.line_filter.as_deref() {
             let finder = memchr::memmem::Finder::new(needle.as_bytes()).into_owned();
             builder = builder.line_filter(move |line: &str| finder.find(line.as_bytes()).is_some());
@@ -80,6 +76,19 @@ impl ScanSource for Logfmt {
             .build()
             .map_err(|e| PolarsError::ComputeError(e.to_string().into()))?
             .scan()
+    }
+}
+
+/// The units of records the source before hands on, as the units polars-logfmt reads.
+struct RecordUnits(Arc<dyn Records>);
+
+impl UnitSource for RecordUnits {
+    fn read_unit(&self, index: usize, dst: &mut Vec<u8>) -> io::Result<bool> {
+        self.0.read_unit(index, dst).map_err(io::Error::other)
+    }
+
+    fn count_units(&self) -> Option<usize> {
+        self.0.count_units()
     }
 }
 
