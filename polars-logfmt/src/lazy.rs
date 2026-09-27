@@ -7,6 +7,7 @@ pub use lazy_logfmt_reader::LazyLogFmtReader;
 pub use lazy_logfmt_reader::LazyLogFmtReaderBuilder;
 pub use logfmt_reader_state::LogFmtReaderState;
 
+use crate::UnitSource;
 use crate::logfmt::{Row, Schema, SchemaField};
 
 use crate::ssh::SshSource;
@@ -62,6 +63,7 @@ fn infer_schema_from_source(
                 .map_err(|e| anyhow::anyhow!("SeekableVfsFile clone failed: {e}"))?;
             Box::new(std::io::BufReader::new(cloned_file))
         }
+        LogFmtSource::Units(units) => Box::new(UnitsReader::new(units.clone())),
     };
     let mut consumed = Vec::new();
     let schema = infer_schema_from_reader(
@@ -72,7 +74,7 @@ fn infer_schema_from_source(
     )?;
     let probe = match source {
         LogFmtSource::Ssh(_) => Some(Box::new(Cursor::new(consumed).chain(reader)) as LineReader),
-        LogFmtSource::Cursor(_) | LogFmtSource::Seekable(_) => None,
+        LogFmtSource::Cursor(_) | LogFmtSource::Seekable(_) | LogFmtSource::Units(_) => None,
     };
     Ok((schema, probe))
 }
@@ -232,6 +234,57 @@ pub enum LogFmtSource {
     Ssh(SshSource),
     Cursor(Cursor<Vec<u8>>),
     Seekable(SeekableSource),
+    Units(Arc<dyn UnitSource>),
+}
+
+/// The units of a [`UnitSource`] read in order as one stream, a unit at a time.
+pub(crate) struct UnitsReader {
+    units: Arc<dyn UnitSource>,
+    next: usize,
+    buf: Vec<u8>,
+    pos: usize,
+}
+
+impl UnitsReader {
+    pub(crate) fn new(units: Arc<dyn UnitSource>) -> Self {
+        Self {
+            units,
+            next: 0,
+            buf: Vec::new(),
+            pos: 0,
+        }
+    }
+}
+
+impl BufRead for UnitsReader {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        while self.pos == self.buf.len() {
+            self.buf.clear();
+            self.pos = 0;
+            if !self.units.read_unit(self.next, &mut self.buf)? {
+                break;
+            }
+            self.next += 1;
+        }
+        Ok(&self.buf[self.pos..])
+    }
+
+    fn consume(&mut self, amt: usize) {
+        self.pos = (self.pos + amt).min(self.buf.len());
+    }
+}
+
+impl Read for UnitsReader {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        let n = {
+            let available = self.fill_buf()?;
+            let n = available.len().min(out.len());
+            out[..n].copy_from_slice(&available[..n]);
+            n
+        };
+        self.consume(n);
+        Ok(n)
+    }
 }
 
 /// Lock the shared seekable handle. A poisoned lock is recovered instead of
@@ -262,6 +315,7 @@ impl Clone for LogFmtSource {
             LogFmtSource::Ssh(s) => LogFmtSource::Ssh(s.clone()),
             LogFmtSource::Cursor(c) => LogFmtSource::Cursor(c.clone()),
             LogFmtSource::Seekable(arc_mutex) => LogFmtSource::Seekable(arc_mutex.clone()),
+            LogFmtSource::Units(units) => LogFmtSource::Units(units.clone()),
         }
     }
 }

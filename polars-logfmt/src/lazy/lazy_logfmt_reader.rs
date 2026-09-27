@@ -1,11 +1,11 @@
-use crate::SeekableVfs;
 use crate::lazy::{
-    LineFilterFn, LineReader, LogFmtReaderState, LogFmtSource, RowFilter, infer_schema_from_reader,
-    infer_schema_from_row, infer_schema_from_source, lock_seekable, logfmt_schema_to_polars_schema,
-    rows_to_dataframe_filled, ssh_reader,
+    LineFilterFn, LineReader, LogFmtReaderState, LogFmtSource, RowFilter, UnitsReader,
+    infer_schema_from_reader, infer_schema_from_row, infer_schema_from_source, lock_seekable,
+    logfmt_schema_to_polars_schema, rows_to_dataframe_filled, ssh_reader,
 };
 use crate::logfmt::{ParsedValue, Row, Schema, SchemaField};
 use crate::ssh::{SshSource, connect_ssh};
+use crate::{SeekableVfs, UnitSource};
 use chrono::DateTime;
 use hashbrown::HashMap;
 use itertools::Itertools;
@@ -65,6 +65,44 @@ impl FrameBytes for Box<dyn crate::SeekableVfsFile + Send> {
 
         buf.truncate(n);
         Ok(Some(range.len))
+    }
+}
+
+/// The frames of a [`UnitSource`]: frame `idx` is unit `idx`.
+struct UnitFrames(Arc<dyn UnitSource>);
+
+impl FrameBytes for UnitFrames {
+    fn read_frame(&mut self, range: &FrameRange, buf: &mut Vec<u8>) -> PolarsResult<Option<u64>> {
+        buf.clear();
+        let found = self
+            .0
+            .read_unit(range.idx, buf)
+            .map_err(|e| polars::error::PolarsError::ComputeError(e.to_string().into()))?;
+        Ok(found.then_some(buf.len() as u64))
+    }
+}
+
+impl FrameBytes for Box<dyn FrameBytes + Send> {
+    fn read_frame(&mut self, range: &FrameRange, buf: &mut Vec<u8>) -> PolarsResult<Option<u64>> {
+        (**self).read_frame(range, buf)
+    }
+}
+
+/// What the workers of the parallel scan take their frames from.
+enum FrameOrigin<'a> {
+    File(&'a (dyn crate::SeekableVfsFile + Send)),
+    Units(&'a Arc<dyn UnitSource>),
+}
+
+impl FrameOrigin<'_> {
+    /// A reader of frames of its own for one worker.
+    fn clone_handle(&self) -> std::io::Result<Box<dyn FrameBytes + Send>> {
+        match self {
+            FrameOrigin::File(file) => file
+                .clone_handle()
+                .map(|h| Box::new(h) as Box<dyn FrameBytes + Send>),
+            FrameOrigin::Units(units) => Ok(Box::new(UnitFrames(Arc::clone(units)))),
+        }
     }
 }
 
@@ -299,6 +337,12 @@ impl LazyLogFmtReader {
         // extract the inner Arc<Mutex<...>> when source is Seekable
         let file_arc = match &self.source {
             LogFmtSource::Seekable(file_arc) => file_arc,
+            LogFmtSource::Units(units) => {
+                return self.predict_schema_from_first_line_handle(
+                    UnitsReader::new(units.clone()),
+                    infer_schema_length,
+                );
+            }
             _ => return Ok(None),
         };
 
@@ -326,7 +370,7 @@ impl LazyLogFmtReader {
 
     fn predict_schema_from_first_line_handle(
         &self,
-        probe: Box<dyn crate::SeekableVfsFile + Send>,
+        probe: impl Read,
         infer_schema_length: usize,
     ) -> PolarsResult<Option<Schema>> {
         let mut br = BufReader::new(probe);
@@ -379,23 +423,43 @@ impl LazyLogFmtReader {
             "tparallel_batch entry",
         );
 
-        let file_arc = match &self.source {
-            LogFmtSource::Seekable(file_arc) => file_arc,
-            _ => return Ok(None),
-        };
+        let file_opt;
+        let (origin, frames, probe): (FrameOrigin, Vec<FrameRange>, Box<dyn Read + Send>) =
+            match &self.source {
+                LogFmtSource::Seekable(file_arc) => {
+                    file_opt = lock_seekable(file_arc);
 
-        let file_opt = lock_seekable(file_arc);
+                    let Some(orig_file) = file_opt.as_ref() else {
+                        return Ok(None);
+                    };
 
-        let Some(orig_file) = file_opt.as_ref() else {
-            return Ok(None);
-        };
-
-        let Ok(mut probe) = orig_file.clone_handle() else {
-            return Ok(None);
-        };
-        let Some(frames) = Self::frames_from_seekable(&mut *probe) else {
-            return Ok(None);
-        };
+                    let Ok(mut probe) = orig_file.clone_handle() else {
+                        return Ok(None);
+                    };
+                    let Some(frames) = Self::frames_from_seekable(&mut *probe) else {
+                        return Ok(None);
+                    };
+                    (FrameOrigin::File(&**orig_file), frames, Box::new(probe))
+                }
+                LogFmtSource::Units(units) => {
+                    let Some(count) = units.count_units() else {
+                        return Ok(None);
+                    };
+                    let frames = (0..count)
+                        .map(|idx| FrameRange {
+                            idx,
+                            start: 0,
+                            len: 0,
+                            is_zst: false,
+                            comp_start: 0,
+                            comp_len: 0,
+                        })
+                        .collect();
+                    let probe = Box::new(UnitsReader::new(units.clone()));
+                    (FrameOrigin::Units(units), frames, probe)
+                }
+                _ => return Ok(None),
+            };
 
         // optional single-thread schema inference (extracted to helper)
         if schema.is_none()
@@ -465,7 +529,7 @@ impl LazyLogFmtReader {
                     let start = w * chunk_size;
                     let end_idx = std::cmp::min(start + chunk_size, frames_len);
 
-                    match orig_file.clone_handle() {
+                    match origin.clone_handle() {
                         Ok(h) => {
                             tracing::debug!(
                                 worker = w,
@@ -480,7 +544,7 @@ impl LazyLogFmtReader {
                             let pred_clone = pred_owned.clone();
                             let with_cols_local = with_columns_owned.clone();
                             let aligned_cols_cnt = self.aligned_cols_cnt;
-                            let df = Self::read_and_parse_from_frames(
+                            let df = Self::parse_frames(
                                 w,
                                 h,
                                 &frame_vec[start..end_idx],
@@ -646,6 +710,7 @@ impl LazyLogFmtReader {
                     })?;
                     Box::new(std::io::BufReader::new(cloned_file)) as LineReader
                 }
+                LogFmtSource::Units(units) => Box::new(UnitsReader::new(units.clone())),
             };
             state.reader = Some(reader);
         }
@@ -2149,6 +2214,7 @@ pub enum SourceSpec {
     Cursor(Cursor<Vec<u8>>),
     Seekable(Box<dyn crate::SeekableVfsFile + Send>),
     Ssh(SshSource),
+    Units(Arc<dyn UnitSource>),
 }
 
 impl Clone for SourceSpec {
@@ -2169,6 +2235,7 @@ impl Clone for SourceSpec {
                 }
             }
             SourceSpec::Ssh(s) => SourceSpec::Ssh(s.clone()),
+            SourceSpec::Units(u) => SourceSpec::Units(u.clone()),
         }
     }
 }
@@ -2255,6 +2322,15 @@ impl LazyLogFmtReaderBuilder {
         self
     }
 
+    /// Use text read by unit as source. When their count is known the units
+    /// are the frames of the parallel scan, as the frames of a seekable zstd
+    /// file are; when it is not, and when the parallel scan yields nothing
+    /// (without `aligned_cols_cnt`), they are read in order.
+    pub fn from_units(mut self, units: Arc<dyn UnitSource>) -> Self {
+        self.source = Some(SourceSpec::Units(units));
+        self
+    }
+
     pub fn cmd(mut self, cmd: Option<String>) -> Self {
         self.cmd = cmd;
         self
@@ -2310,6 +2386,7 @@ impl LazyLogFmtReaderBuilder {
             ))),
             Some(SourceSpec::Cursor(c)) => Ok(LogFmtSource::Cursor(c)),
             Some(SourceSpec::Ssh(s)) => Ok(LogFmtSource::Ssh(s)),
+            Some(SourceSpec::Units(u)) => Ok(LogFmtSource::Units(u)),
             None => Err(anyhow::anyhow!("LazyLogFmtReaderBuilder.source is not set")),
         }
     }
@@ -2327,6 +2404,7 @@ impl LazyLogFmtReaderBuilder {
             }
             LogFmtSource::Cursor(c) => SourceSpec::Cursor(c.clone()),
             LogFmtSource::Ssh(s) => SourceSpec::Ssh(s.clone()),
+            LogFmtSource::Units(u) => SourceSpec::Units(u.clone()),
         });
         Ok(self)
     }

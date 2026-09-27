@@ -23,6 +23,20 @@ pub trait SeekableVfsFile: Send + Sync + std::io::Read {
     }
 }
 
+/// Text read a unit at a time by number, each unit whole lines: the frames of
+/// a compressed file as whatever decompresses them hands them on. The units in
+/// the order of their numbers are the text, and any of them can be read from
+/// several threads at once.
+pub trait UnitSource: Send + Sync {
+    /// Appends unit `index` to `dst` and returns `true`, or returns `false`
+    /// when there is no such unit. A unit may be empty.
+    fn read_unit(&self, index: usize, dst: &mut Vec<u8>) -> Result<bool>;
+
+    /// How many units there are, or `None` when that is only known by reading
+    /// them. Without it the units are read in order on one thread.
+    fn count_units(&self) -> Option<usize>;
+}
+
 pub trait SeekableVfs: Send + Sync {
     fn open(&self, path: &str) -> Result<Box<dyn SeekableVfsFile>>;
     fn stat(&self, path: &str) -> Result<VfsFileStat>;
