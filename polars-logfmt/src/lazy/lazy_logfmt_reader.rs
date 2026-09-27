@@ -60,8 +60,15 @@ impl FrameBytes for Box<dyn crate::SeekableVfsFile + Send> {
 
         buf.resize(range.len as usize, 0);
 
-        let n = Read::read(self, buf)
-            .map_err(|e| polars::error::PolarsError::ComputeError(e.to_string().into()))?;
+        let mut n = 0;
+        while n < buf.len() {
+            let read = Read::read(self, &mut buf[n..])
+                .map_err(|e| polars::error::PolarsError::ComputeError(e.to_string().into()))?;
+            if read == 0 {
+                break;
+            }
+            n += read;
+        }
 
         buf.truncate(n);
         Ok(Some(range.len))
