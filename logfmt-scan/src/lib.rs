@@ -1,15 +1,16 @@
 //! The `logfmt` scan source for `nu_plugin_polars_dyn`: bytes of logfmt lines into a frame.
 //!
-//! Build a plugin with it compiled in, beside the sources that open and decompress:
+//! Build a plugin with it compiled in, beside the sources that open:
 //!
 //! ```nu
-//! nu-polars-dyn-build seekzstdsep_scan ssh_scan logfmt_scan --path seekzstdsep_scan=../nu_plugin_polars_dyn/seekzstdsep-scan --path ssh_scan=../nu_plugin_polars_dyn/ssh-scan --path logfmt_scan=./logfmt-scan
+//! nu-polars-dyn-build ssh_scan logfmt_scan --path ssh_scan=../nu_plugin_polars_dyn/ssh-scan --path logfmt_scan=./logfmt-scan
 //! ```
 //!
-//! It ends a chain: the suffix `.logfmt` puts it last, and whatever came before — `file`, `ssh`,
-//! `seek-zst` — hands it the bytes. So `app.logfmt`, `app.logfmt.seek.zst` and
-//! `ssh://host/var/log/app.logfmt.seek.zst` all reach the same `scan`, which never learns where
-//! the bytes came from.
+//! It ends a chain: the suffix `.logfmt` puts it last, and whatever came before — `file`, `ssh` —
+//! hands it the bytes. So `app.logfmt` and `ssh://host/var/log/app.logfmt` reach the same `scan`,
+//! which never learns where the bytes came from. It reads bytes by offset only: polars-logfmt
+//! reads the frames of a file in parallel by seeking into it, so the units of records a source such
+//! as `seek-zst` hands on are refused, and `app.logfmt.seek.zst` is not read.
 //!
 //! `--opts` under `logfmt` is `polars_logfmt::LogfmtScanOpts` as JSON, so every field may be left
 //! out and an unknown key is an error. `cmd` — a command to run over ssh — is refused: opening is
@@ -17,13 +18,13 @@
 //!
 //! ```nu
 //! polars_dyn open app.logfmt --opts {logfmt: {line_filter: "level=error", batch_size: 1000}}
-//! polars_dyn open ssh://user@host/var/log/app.logfmt.seek.zst --opts {ssh: {port: 2222}}
+//! polars_dyn open ssh://user@host/var/log/app.logfmt --opts {ssh: {port: 2222}}
 //! ```
 
 use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::Arc;
 
-use nu_plugin_polars::scan::{ReadAt, ReadAtCursor, ScanSource, parse_opts};
+use nu_plugin_polars::scan::{Bytes, ReadAt, ReadAtCursor, ScanSource, parse_opts};
 use polars::prelude::{LazyFrame, PolarsError, PolarsResult, polars_bail};
 use polars_logfmt::lazy::{DEFAULT_INFER_SCHEMA_LENGTH, LazyLogFmtReaderBuilder};
 use polars_logfmt::{LogfmtScanOpts, SeekableVfsFile, VfsFileStat};
@@ -45,7 +46,14 @@ impl ScanSource for Logfmt {
         &[".logfmt"]
     }
 
-    fn scan(&self, source: Arc<dyn ReadAt>, opts: &[u8]) -> PolarsResult<LazyFrame> {
+    fn scan(&self, source: Bytes, opts: &[u8]) -> PolarsResult<LazyFrame> {
+        let Bytes::At(source) = source else {
+            polars_bail!(
+                ComputeError:
+                "`logfmt` reads its source by offset, and the one before it hands records: \
+                 a `.logfmt.seek.zst` is not read"
+            )
+        };
         let opts: LogfmtScanOpts = serde_json::from_value(Value::Object(parse_opts(opts)?))
             .map_err(|e| PolarsError::ComputeError(format!("opts: {e}").into()))?;
         if opts.cmd.is_some() {
