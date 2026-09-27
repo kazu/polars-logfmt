@@ -40,6 +40,34 @@ pub struct FrameRange {
     pub comp_len: u64,
 }
 
+/// Where the parallel scan reads the bytes of a frame from.
+trait FrameBytes {
+    /// Replaces `buf` with the bytes of `range` and returns their length, or
+    /// `None` when the frame is to be skipped.
+    fn read_frame(&mut self, range: &FrameRange, buf: &mut Vec<u8>) -> PolarsResult<Option<u64>>;
+}
+
+impl FrameBytes for Box<dyn crate::SeekableVfsFile + Send> {
+    fn read_frame(&mut self, range: &FrameRange, buf: &mut Vec<u8>) -> PolarsResult<Option<u64>> {
+        if range.len == 0 {
+            return Ok(None);
+        }
+
+        self.seek(range.start)
+            .map_err(|e| polars::error::PolarsError::ComputeError(e.to_string().into()))?;
+        // Read the full (decompressed) frame into a single buffer using
+        // larger reads to avoid many small SFTP/decoder read calls.
+
+        buf.resize(range.len as usize, 0);
+
+        let n = Read::read(self, buf)
+            .map_err(|e| polars::error::PolarsError::ComputeError(e.to_string().into()))?;
+
+        buf.truncate(n);
+        Ok(Some(range.len))
+    }
+}
+
 pub struct LazyLogFmtReader {
     pub source: LogFmtSource,
     pub cmd: Option<String>,
@@ -854,7 +882,34 @@ impl LazyLogFmtReader {
     /// With `row_cap = (n, counter)`, stop once `counter` has reached `n`.
     pub fn read_and_parse_from_frames(
         worker: usize,
-        mut handle: Box<dyn crate::SeekableVfsFile + Send>,
+        handle: Box<dyn crate::SeekableVfsFile + Send>,
+        ranges: &[FrameRange],
+        schema: Option<&Schema>,
+        line_filter: Option<LineFilterFn>,
+        row_filter: Option<&RowFilter>,
+        predicate: Option<Expr>,
+        row_cap: Option<(usize, &AtomicUsize)>,
+        aligned_cols_cnt: bool,
+        with_columns: Option<&Vec<String>>,
+    ) -> PolarsResult<DataFrame> {
+        Self::parse_frames(
+            worker,
+            handle,
+            ranges,
+            schema,
+            line_filter,
+            row_filter,
+            predicate,
+            row_cap,
+            aligned_cols_cnt,
+            with_columns,
+        )
+    }
+
+    /// [`Self::read_and_parse_from_frames`] over any [`FrameBytes`].
+    fn parse_frames<F: FrameBytes>(
+        worker: usize,
+        mut handle: F,
         ranges: &[FrameRange],
         schema: Option<&Schema>,
         line_filter: Option<LineFilterFn>,
@@ -875,7 +930,7 @@ impl LazyLogFmtReader {
         let use_df_maker = true;
         // helper to process a single frame into optional DataFrame
         let process_one = |range: &FrameRange,
-                           handle: &mut Box<dyn crate::SeekableVfsFile + Send>,
+                           handle: &mut F,
                            schema: Option<&Schema>,
                            column_keys: &mut Vec<String>,
                            df_maker: &mut DataFrameMaker,
@@ -898,23 +953,9 @@ impl LazyLogFmtReader {
                 return Ok(None);
             }
 
-            if range.len == 0 {
+            let Some(frame_len) = handle.read_frame(range, buf)? else {
                 return Ok(None);
-            }
-
-            handle
-                .seek(range.start)
-                .map_err(|e| polars::error::PolarsError::ComputeError(e.to_string().into()))?;
-            // Read the full (decompressed) frame into a single buffer using
-            // larger reads to avoid many small SFTP/decoder read calls.
-
-            buf.resize(range.len as usize, 0);
-
-            let n = handle
-                .read(buf)
-                .map_err(|e| polars::error::PolarsError::ComputeError(e.to_string().into()))?;
-
-            buf.truncate(n);
+            };
 
             let cursor = Cursor::new(buf);
             let mut br = BufReader::new(cursor);
@@ -988,7 +1029,7 @@ impl LazyLogFmtReader {
                         df_maker.schema = Some(infer_schema_from_row(first_row));
                     }
                     if df_maker.n_rows_hint.is_none() {
-                        df_maker.n_rows_hint = Some(120 * range.len as usize / line.len() / 100);
+                        df_maker.n_rows_hint = Some(120 * frame_len as usize / line.len() / 100);
                     }
 
                     df_maker.push_line(&line);
